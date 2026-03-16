@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Phase 2 face swap pipeline using InsightFace inswapper.
+Face swap pipeline using InsightFace inswapper + BiSeNet head masking.
 
-Takes a source face image and a target video, swaps the specified face
-in every frame, and outputs the result with original audio.
+Swaps the face in every frame of a target video, using BiSeNet face parsing
+to create an expanded head mask (hair, ears, neck, jaw) for seamless blending.
 
 Usage:
     python scripts/faceswap.py --source source_face.png --target input/scene.mov
+    python scripts/faceswap.py --source source_face.png --target input/scene.mov --face-only
     python scripts/faceswap.py --source source_face.png --target input/scene.mov --target-index 1
 """
 
@@ -21,6 +22,8 @@ import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 import insightface
+
+from scripts.head_mask import HeadMaskGenerator, blend_with_head_mask
 
 
 def get_video_info(video_path: str) -> dict:
@@ -90,28 +93,35 @@ def swap_faces(
     swapper,
     app: FaceAnalysis,
     target_index: int = 0,
+    head_masker: HeadMaskGenerator | None = None,
 ) -> list[np.ndarray]:
-    """Swap face in each frame. Returns list of processed frames.
+    """Swap face in each frame with optional full-head blending.
 
     target_index: which face in the frame to replace (sorted left-to-right).
                   Use -1 to replace all detected faces.
+    head_masker: if provided, uses BiSeNet head mask for expanded blending.
+                 If None, falls back to inswapper's default tight face mask.
     """
     output_frames = []
 
     for i, frame in enumerate(frames):
+        original = frame.copy()
         result = frame.copy()
         faces = app.get(frame)
 
         if faces:
-            # Sort faces left-to-right by x-coordinate for consistent indexing
             faces = sorted(faces, key=lambda f: f.bbox[0])
 
             if target_index == -1:
-                # Replace all faces
                 for face in faces:
                     result = swapper.get(result, face, source_face, paste_back=True)
             elif target_index < len(faces):
                 result = swapper.get(result, faces[target_index], source_face, paste_back=True)
+
+            # Apply head mask blending if enabled
+            if head_masker is not None:
+                mask = head_masker.head_mask(original)
+                result = blend_with_head_mask(original, result, mask)
 
         output_frames.append(result)
 
@@ -188,6 +198,8 @@ def main():
                              "Use -1 to replace all faces. Default: 0")
     parser.add_argument("--output-dir", default="output",
                         help="Directory for output files (default: output/)")
+    parser.add_argument("--face-only", action="store_true",
+                        help="Use tight face mask only (skip BiSeNet head masking)")
     parser.add_argument("--gpu", action="store_true",
                         help="Use CUDA GPU acceleration (for RunPod)")
     args = parser.parse_args()
@@ -206,28 +218,38 @@ def main():
         else ["CPUExecutionProvider"]
     )
 
+    device = "cuda" if args.gpu else "cpu"
+
     # --- Step 1: Initialize models ---
-    print("[1/5] Loading face analysis model...")
+    print("[1/6] Loading face analysis model...")
     app = FaceAnalysis(name="buffalo_l", providers=providers)
     app.prepare(ctx_id=0, det_size=(640, 640))
 
-    print("[2/5] Loading swapper model...")
+    print("[2/6] Loading swapper model...")
     swapper = get_swapper_model()
 
+    head_masker = None
+    if not args.face_only:
+        print("[3/6] Loading BiSeNet head parser...")
+        head_masker = HeadMaskGenerator(device=device)
+    else:
+        print("[3/6] Skipping head masking (--face-only)")
+
     # --- Step 2: Load source face ---
-    print("[3/5] Analyzing source face...")
+    print("[4/6] Analyzing source face...")
     source_face = load_source_face(args.source, app)
 
     # --- Step 3: Extract target frames ---
-    print("[4/5] Extracting target video frames...")
+    print("[5/6] Extracting target video frames...")
     info = get_video_info(args.target)
     print(f"  {info['width']}x{info['height']} @ {info['fps']:.3f} fps, "
           f"{info['duration']:.1f}s")
     frames = extract_frames(args.target)
 
     # --- Step 4: Swap faces ---
-    print("[5/5] Swapping faces...")
-    swapped = swap_faces(frames, source_face, swapper, app, args.target_index)
+    print("[6/6] Swapping faces (head mask: {'off' if args.face_only else 'on'})...")
+    swapped = swap_faces(frames, source_face, swapper, app, args.target_index,
+                         head_masker=head_masker)
 
     # --- Step 5: Compose output ---
     stem = Path(args.target).stem
