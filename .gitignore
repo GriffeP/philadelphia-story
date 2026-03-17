@@ -4,4 +4,5 @@ __pycache__/
 input/
 output/
 models/*.onnx
+models/*.pth
 .DS_Store

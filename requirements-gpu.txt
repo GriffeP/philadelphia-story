@@ -4,4 +4,8 @@ onnxruntime-gpu>=1.16
 numpy>=1.24
 torch>=2.0
 torchvision>=0.15
+diffusers>=0.25
+transformers
+accelerate
+safetensors
 runpod>=1.6

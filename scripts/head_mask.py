@@ -74,19 +74,27 @@ class HeadMaskGenerator:
     def head_mask(
         self,
         bgr_image: np.ndarray,
+        face_bbox: tuple[float, float, float, float] | None = None,
         labels: set[int] | None = None,
         feather_radius: int = 11,
         dilate_px: int = 10,
+        bbox_expand: float = 1.5,
     ) -> np.ndarray:
         """Generate a soft full-head mask for blending.
 
         Args:
             bgr_image: Input BGR frame.
+            face_bbox: (x1, y1, x2, y2) bounding box of the target face.
+                       If provided, only the head region overlapping this
+                       expanded bbox is included — prevents masking other
+                       faces in the frame.
             labels: Set of label indices to include. Defaults to HEAD_LABELS.
             feather_radius: Gaussian blur kernel size for edge softening.
                             Must be odd. 0 disables feathering.
             dilate_px: Pixels to dilate the mask before feathering, to push
                        the blend boundary outward past segmentation edges.
+            bbox_expand: Factor to expand face_bbox to capture hair/neck
+                         beyond the tight face box. Default 1.5 (50% larger).
 
         Returns:
             Float32 mask (H, W) in [0, 1] — 1.0 inside the head region.
@@ -98,6 +106,22 @@ class HeadMaskGenerator:
         mask = np.zeros(parsing.shape, dtype=np.uint8)
         for label in labels:
             mask[parsing == label] = 255
+
+        # Restrict to the target face region if bbox provided
+        if face_bbox is not None:
+            h, w = mask.shape
+            x1, y1, x2, y2 = face_bbox
+            bw, bh = x2 - x1, y2 - y1
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            # Expand bbox to capture hair and neck
+            ex1 = max(0, int(cx - bw * bbox_expand))
+            ey1 = max(0, int(cy - bh * bbox_expand))
+            ex2 = min(w, int(cx + bw * bbox_expand))
+            ey2 = min(h, int(cy + bh * bbox_expand))
+            # Zero out everything outside the expanded bbox
+            region_mask = np.zeros_like(mask)
+            region_mask[ey1:ey2, ex1:ex2] = 255
+            mask = cv2.bitwise_and(mask, region_mask)
 
         # Fill small holes inside the mask (e.g. missed pixels between
         # hair strands) using morphological closing

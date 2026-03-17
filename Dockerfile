@@ -31,4 +31,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && \
       "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx" && \
     apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
+# Pre-download SD 1.5 inpainting model + IP-Adapter at build time
+RUN python3 -c "\
+from diffusers import AutoPipelineForInpainting; \
+pipe = AutoPipelineForInpainting.from_pretrained( \
+    'runwayml/stable-diffusion-inpainting', \
+    safety_checker=None); \
+pipe.load_ip_adapter('h94/IP-Adapter', subfolder='models', \
+    weight_name='ip-adapter-plus_sd15.bin'); \
+print('SD inpainting + IP-Adapter cached')"
+
+# Pre-download BiSeNet weights
+COPY models/79999_iter.pth /app/models/79999_iter.pth
+
 CMD ["python3", "scripts/runpod_handler.py"]

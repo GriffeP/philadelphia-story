@@ -24,6 +24,7 @@ from insightface.app import FaceAnalysis
 import insightface
 
 from scripts.head_mask import HeadMaskGenerator, blend_with_head_mask
+from scripts.mask_editor import load_profile, profile_to_mask
 
 
 def get_video_info(video_path: str) -> dict:
@@ -87,6 +88,24 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
     return frames
 
 
+def amplify_swap(
+    original: np.ndarray,
+    swapped: np.ndarray,
+    intensity: float,
+) -> np.ndarray:
+    """Amplify the difference between original and swapped frames.
+
+    intensity=1.0 returns the raw swap. Values >1 push the result further
+    from the original (e.g. 2.0 doubles the change). Useful when inswapper
+    produces too-subtle results.
+    """
+    if intensity == 1.0:
+        return swapped
+    diff = swapped.astype(np.float32) - original.astype(np.float32)
+    amplified = original.astype(np.float32) + diff * intensity
+    return np.clip(amplified, 0, 255).astype(np.uint8)
+
+
 def swap_faces(
     frames: list[np.ndarray],
     source_face: object,
@@ -94,13 +113,19 @@ def swap_faces(
     app: FaceAnalysis,
     target_index: int = 0,
     head_masker: HeadMaskGenerator | None = None,
+    mask_profile: list | None = None,
+    passes: int = 1,
+    intensity: float = 1.0,
 ) -> list[np.ndarray]:
     """Swap face in each frame with optional full-head blending.
 
     target_index: which face in the frame to replace (sorted left-to-right).
                   Use -1 to replace all detected faces.
     head_masker: if provided, uses BiSeNet head mask for expanded blending.
-                 If None, falls back to inswapper's default tight face mask.
+    mask_profile: if provided, uses the user-drawn landmark-relative mask
+                  instead of BiSeNet. Takes priority over head_masker.
+    passes: number of times to run inswapper per frame.
+    intensity: amplification factor for the swap difference.
     """
     output_frames = []
 
@@ -114,14 +139,31 @@ def swap_faces(
 
             if target_index == -1:
                 for face in faces:
-                    result = swapper.get(result, face, source_face, paste_back=True)
+                    for _ in range(passes):
+                        result = swapper.get(result, face, source_face, paste_back=True)
+                if intensity != 1.0:
+                    result = amplify_swap(original, result, intensity)
+                if head_masker is not None:
+                    mask = head_masker.head_mask(original)
+                    result = blend_with_head_mask(original, result, mask)
             elif target_index < len(faces):
-                result = swapper.get(result, faces[target_index], source_face, paste_back=True)
+                target_face = faces[target_index]
+                for _ in range(passes):
+                    result = swapper.get(result, target_face, source_face, paste_back=True)
+                if intensity != 1.0:
+                    result = amplify_swap(original, result, intensity)
 
-            # Apply head mask blending if enabled
-            if head_masker is not None:
-                mask = head_masker.head_mask(original)
-                result = blend_with_head_mask(original, result, mask)
+                # Apply mask: user profile > BiSeNet > inswapper default
+                if mask_profile is not None and hasattr(target_face, "landmark_2d_106"):
+                    landmarks = target_face.landmark_2d_106
+                    mask = profile_to_mask(
+                        mask_profile, landmarks, original.shape[:2],
+                    )
+                    result = blend_with_head_mask(original, result, mask)
+                elif head_masker is not None:
+                    bbox = tuple(target_face.bbox.tolist())
+                    mask = head_masker.head_mask(original, face_bbox=bbox)
+                    result = blend_with_head_mask(original, result, mask)
 
         output_frames.append(result)
 
@@ -198,6 +240,15 @@ def main():
                              "Use -1 to replace all faces. Default: 0")
     parser.add_argument("--output-dir", default="output",
                         help="Directory for output files (default: output/)")
+    parser.add_argument("-p", "--passes", type=int, default=1,
+                        help="Number of swap passes per frame. More passes = "
+                             "stronger identity transfer. Try 3-5. Default: 1")
+    parser.add_argument("-i", "--intensity", type=float, default=1.0,
+                        help="Amplify swap difference. 1.0=normal, 2.0=double "
+                             "the change. Try 1.5-3.0 for dramatic results. Default: 1.0")
+    parser.add_argument("--mask-profile", default=None,
+                        help="Path to mask profile JSON from mask_editor. "
+                             "Overrides BiSeNet head masking with your custom outline.")
     parser.add_argument("--face-only", action="store_true",
                         help="Use tight face mask only (skip BiSeNet head masking)")
     parser.add_argument("--gpu", action="store_true",
@@ -229,7 +280,11 @@ def main():
     swapper = get_swapper_model()
 
     head_masker = None
-    if not args.face_only:
+    mask_prof = None
+    if args.mask_profile:
+        print(f"[3/6] Loading custom mask profile: {args.mask_profile}")
+        mask_prof = load_profile(args.mask_profile)
+    elif not args.face_only:
         print("[3/6] Loading BiSeNet head parser...")
         head_masker = HeadMaskGenerator(device=device)
     else:
@@ -247,9 +302,11 @@ def main():
     frames = extract_frames(args.target)
 
     # --- Step 4: Swap faces ---
-    print("[6/6] Swapping faces (head mask: {'off' if args.face_only else 'on'})...")
+    print(f"[6/6] Swapping faces (head mask: {'off' if args.face_only else 'on'}, "
+          f"passes: {args.passes}, intensity: {args.intensity})...")
     swapped = swap_faces(frames, source_face, swapper, app, args.target_index,
-                         head_masker=head_masker)
+                         head_masker=head_masker, mask_profile=mask_prof,
+                         passes=args.passes, intensity=args.intensity)
 
     # --- Step 5: Compose output ---
     stem = Path(args.target).stem
