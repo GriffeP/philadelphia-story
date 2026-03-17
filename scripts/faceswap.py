@@ -106,6 +106,53 @@ def amplify_swap(
     return np.clip(amplified, 0, 255).astype(np.uint8)
 
 
+def color_match(source: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Match brightness and contrast of swapped region to the surrounding area.
+
+    Uses mean/std histogram matching within the masked region to align the
+    swapped face's luminance with the original frame's skin tones.
+
+    Args:
+        source: The swapped frame (BGR).
+        target: The original frame (BGR).
+        mask: Float32 (H, W) mask in [0, 1] — 1.0 in the swapped region.
+
+    Returns:
+        Color-matched frame (BGR).
+    """
+    # Work in LAB color space for perceptual uniformity
+    src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
+    tgt_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    mask_bool = mask > 0.5
+
+    # Also compute stats from a border region around the mask (the blending zone)
+    # to get the target skin tone right at the boundary
+    dilated = cv2.dilate(
+        (mask * 255).astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)),
+    )
+    border = (dilated > 128) & ~mask_bool
+
+    if mask_bool.sum() < 100 or border.sum() < 100:
+        return source
+
+    for ch in range(3):
+        src_vals = src_lab[:, :, ch][mask_bool]
+        tgt_vals = tgt_lab[:, :, ch][border]
+
+        src_mean, src_std = src_vals.mean(), max(src_vals.std(), 1e-6)
+        tgt_mean, tgt_std = tgt_vals.mean(), max(tgt_vals.std(), 1e-6)
+
+        # Normalize source to match target statistics
+        src_lab[:, :, ch][mask_bool] = (
+            (src_vals - src_mean) * (tgt_std / src_std) + tgt_mean
+        )
+
+    src_lab = np.clip(src_lab, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(src_lab, cv2.COLOR_LAB2BGR)
+
+
 def swap_faces(
     frames: list[np.ndarray],
     source_face: object,
@@ -158,11 +205,17 @@ def swap_faces(
                     landmarks = target_face.landmark_2d_106
                     mask = profile_to_mask(
                         mask_profile, landmarks, original.shape[:2],
+                        feather_radius=61, dilate_px=12,
                     )
+                    result = color_match(result, original, mask)
                     result = blend_with_head_mask(original, result, mask)
                 elif head_masker is not None:
                     bbox = tuple(target_face.bbox.tolist())
-                    mask = head_masker.head_mask(original, face_bbox=bbox)
+                    mask = head_masker.head_mask(
+                        original, face_bbox=bbox,
+                        feather_radius=61, dilate_px=12,
+                    )
+                    result = color_match(result, original, mask)
                     result = blend_with_head_mask(original, result, mask)
 
         output_frames.append(result)
@@ -240,9 +293,9 @@ def main():
                              "Use -1 to replace all faces. Default: 0")
     parser.add_argument("--output-dir", default="output",
                         help="Directory for output files (default: output/)")
-    parser.add_argument("-p", "--passes", type=int, default=1,
+    parser.add_argument("-p", "--passes", type=int, default=3,
                         help="Number of swap passes per frame. More passes = "
-                             "stronger identity transfer. Try 3-5. Default: 1")
+                             "stronger identity transfer. Try 3-5. Default: 3")
     parser.add_argument("-i", "--intensity", type=float, default=1.0,
                         help="Amplify swap difference. 1.0=normal, 2.0=double "
                              "the change. Try 1.5-3.0 for dramatic results. Default: 1.0")
